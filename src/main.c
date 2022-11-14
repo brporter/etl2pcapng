@@ -92,11 +92,32 @@ static const char* DOT11_PHY_TYPE_NAMES[] = {
     "802.11ax"        // dot11_phy_type_he = 10
 };
 
+// Filter data structure
+typedef struct _FILTER_RULE {
+    ADDRESS_FAMILY Family;
+    TCP_HDR Tcp;
+    union {
+        IPV4_HEADER IPv4;
+        IPV6_HEADER IPv6;
+    };
+} FILTER_RULE, *PFILTER_RULE;
+
 HANDLE OutFile = INVALID_HANDLE_VALUE;
 unsigned long long NumFramesConverted = 0;
 BOOLEAN Pass2 = FALSE;
 char AuxFragBuf[MAX_PACKET_SIZE] = {0};
 unsigned long AuxFragBufOffset = 0;
+
+ // .Family == AF_UNSPEC (0)
+
+FILTER_RULE Filter = {
+    .Family = AF_INET,
+    .IPv4.DestinationAddress.S_un.S_addr = 16777343,
+    .Tcp.th_dport = 0,
+    .Tcp.th_sport = 0
+};
+
+
 
 DOT11_EXTSTA_RECV_CONTEXT PacketMetadata;
 BOOLEAN AddWlanMetadata = FALSE;
@@ -490,6 +511,96 @@ void ParseVmSwitchPacketFragment(PEVENT_RECORD ev)
     }
 }
 
+BOOLEAN matchIPv4(PIPV4_HEADER src, PTCP_HDR tcp, PFILTER_RULE filter)
+{
+    BOOLEAN retVal = TRUE;
+
+    // INADDR_ANY means the address isn't set, match anything
+    // 0 for a port means the port filter isn't set, match anything
+    if (filter->Family != AF_INET)
+        retVal = FALSE;
+
+    // Match Destination Address
+    if (retVal && filter->IPv4.DestinationAddress.S_un.S_addr != INADDR_ANY) {
+        retVal = 
+            filter->IPv4.DestinationAddress.S_un.S_addr == src->DestinationAddress.S_un.S_addr
+            ? TRUE
+            : FALSE;
+    }
+
+    // Match Source Address
+    if (retVal && filter->IPv4.SourceAddress.S_un.S_addr != INADDR_ANY) {
+        retVal = 
+            filter->IPv4.SourceAddress.S_un.S_addr == src->SourceAddress.S_un.S_addr
+            ? TRUE
+            : FALSE;
+    }
+
+    // Match Destination Port
+    if (retVal && filter->Tcp.th_sport != 0) {
+        retVal = 
+            filter->Tcp.th_sport == tcp->th_sport
+            ? TRUE
+            : FALSE;
+    }
+
+    // Match Source Port
+    if (retVal && filter->Tcp.th_dport != 0) {
+        retVal = 
+            filter->Tcp.th_dport == tcp->th_dport
+            ? TRUE
+            : FALSE;
+    }
+
+    return retVal;
+}
+
+BOOLEAN matchIPv6(PIPV6_HEADER src, PTCP_HDR tcp, PFILTER_RULE filter)
+{
+    BOOLEAN retVal = TRUE;
+
+    // INADDR_ANY means the address isn't set, match anything
+    // 0 for a port means the port filter isn't set, match anything
+    if (filter->Family != AF_INET)
+        retVal = FALSE;
+
+    // Match Destination Address
+    if (retVal && memcmp(filter->IPv6.DestinationAddress.u.Byte, in6addr_any.u.Byte, 16) != 0)
+    {
+        retVal = 
+            memcmp(filter->IPv6.DestinationAddress.u.Byte, src->DestinationAddress.u.Byte, 16) == 0
+            ? TRUE
+            : FALSE;
+    }
+
+    // Match Source Address
+    if (retVal && memcmp(filter->IPv6.SourceAddress.u.Byte, in6addr_any.u.Byte, 16) != 0)
+    {
+        retVal = 
+            memcmp(filter->IPv6.SourceAddress.u.Byte, src->SourceAddress.u.Byte, 16) == 0
+            ? TRUE
+            : FALSE;
+    }
+
+    // Match Destination Port
+    if (retVal && filter->Tcp.th_sport != 0) {
+        retVal = 
+            filter->Tcp.th_sport == tcp->th_sport
+            ? TRUE
+            : FALSE;
+    }
+
+    // Match Source Port
+    if (retVal && filter->Tcp.th_dport != 0) {
+        retVal = 
+            filter->Tcp.th_dport == tcp->th_dport
+            ? TRUE
+            : FALSE;
+    }
+
+    return retVal;
+}
+
 void WINAPI EventCallback(PEVENT_RECORD ev)
 {
     int Err;
@@ -713,6 +824,8 @@ void WINAPI EventCallback(PEVENT_RECORD ev)
 
         TotalFragmentLength = AuxFragBufOffset + FragLength;
 
+        BOOLEAN shouldWrite = TRUE;
+
         // Parse the packet to see if it's truncated. If so, try to recover the original length.
         if (Type == PCAPNG_LINKTYPE_ETHERNET) {
             if (TotalFragmentLength >= sizeof(ETHERNET_HEADER)) {
@@ -720,10 +833,18 @@ void WINAPI EventCallback(PEVENT_RECORD ev)
                 if (ntohs(EthHdr->Type) == ETHERNET_TYPE_IPV4 &&
                     TotalFragmentLength >= sizeof(IPV4_HEADER) + sizeof(ETHERNET_HEADER)) {
                     Ipv4Hdr = (PIPV4_HEADER)(EthHdr + 1);
+                    PTCP_HDR TcpHdr =  (PTCP_HDR)(Ipv4Hdr + 1);
+
+                    shouldWrite = matchIPv4(Ipv4Hdr, TcpHdr, &Filter);
+
                     InferredOriginalFragmentLength = ntohs(Ipv4Hdr->TotalLength) + sizeof(ETHERNET_HEADER);
                 } else if (ntohs(EthHdr->Type) == ETHERNET_TYPE_IPV6 &&
                            TotalFragmentLength >= sizeof(IPV6_HEADER) + sizeof(ETHERNET_HEADER)) {
                     Ipv6Hdr = (PIPV6_HEADER)(EthHdr + 1);
+                    PTCP_HDR TcpHdr =  (PTCP_HDR)(Ipv6Hdr + 1);
+
+                    shouldWrite = matchIPv6(Ipv6Hdr, TcpHdr, &Filter);
+
                     InferredOriginalFragmentLength = ntohs(Ipv6Hdr->PayloadLength) + sizeof(IPV6_HEADER) + sizeof(ETHERNET_HEADER);
                 }
             }
@@ -732,29 +853,37 @@ void WINAPI EventCallback(PEVENT_RECORD ev)
             if (TotalFragmentLength >= sizeof(IPV4_HEADER)) {
                 Ipv4Hdr = (PIPV4_HEADER)AuxFragBuf;
                 if (Ipv4Hdr->Version == 4) {
+                    PTCP_HDR TcpHdr =  (PTCP_HDR)(Ipv4Hdr + 1);
+
+                    shouldWrite = matchIPv4(Ipv4Hdr, TcpHdr, &Filter);
                     InferredOriginalFragmentLength = ntohs(Ipv4Hdr->TotalLength) + sizeof(ETHERNET_HEADER);
                 } else if (Ipv4Hdr->Version == 6) {
                     Ipv6Hdr = (PIPV6_HEADER)(AuxFragBuf);
+                    PTCP_HDR TcpHdr =  (PTCP_HDR)(Ipv6Hdr + 1);
+
+                    shouldWrite = matchIPv6(Ipv6Hdr, TcpHdr, &Filter);
                     InferredOriginalFragmentLength = ntohs(Ipv6Hdr->PayloadLength) + sizeof(IPV6_HEADER) + sizeof(ETHERNET_HEADER);
                 }
             }
         }
 
-        PcapNgWriteEnhancedPacket(
-            OutFile,
-            AuxFragBuf,
-            TotalFragmentLength,
-            // For LSO v2 packets, inferred original fragment length is ignored since length field in IP header is not filled.
-            InferredOriginalFragmentLength <= TotalFragmentLength ? TotalFragmentLength : InferredOriginalFragmentLength,
-            Iface->PcapNgIfIndex,
-            !!(ev->EventHeader.EventDescriptor.Keyword & KW_SEND),
-            TimeStamp.HighPart,
-            TimeStamp.LowPart,
-            CommentLength > 0 ? (char*)&Comment : NULL,
-            (unsigned short)CommentLength);
+        if (shouldWrite) {
+            PcapNgWriteEnhancedPacket(
+                OutFile,
+                AuxFragBuf,
+                TotalFragmentLength,
+                // For LSO v2 packets, inferred original fragment length is ignored since length field in IP header is not filled.
+                InferredOriginalFragmentLength <= TotalFragmentLength ? TotalFragmentLength : InferredOriginalFragmentLength,
+                Iface->PcapNgIfIndex,
+                !!(ev->EventHeader.EventDescriptor.Keyword & KW_SEND),
+                TimeStamp.HighPart,
+                TimeStamp.LowPart,
+                CommentLength > 0 ? (char*)&Comment : NULL,
+                (unsigned short)CommentLength);
 
-        AuxFragBufOffset = 0;
-        NumFramesConverted++;
+            AuxFragBufOffset = 0;
+            NumFramesConverted++;
+        }
     } else {
         AuxFragBufOffset += FragLength;
     }
